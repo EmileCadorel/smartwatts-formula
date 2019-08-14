@@ -46,9 +46,10 @@ def generate_smartwatts_parser() -> ComponentSubParser:
 
     # CPU topology information
     parser.add_argument('cpu-base-clock', help='CPU base clock (in MHz)', type=int, default=100)
-    parser.add_argument('cpu-ratio-min', help='CPU minimal frequency ratio', type=int, default=10)
-    parser.add_argument('cpu-ratio-base', help='CPU base frequency ratio', type=int, default=23)
-    parser.add_argument('cpu-ratio-max', help='CPU maximal frequency ratio (with Turbo-Boost)', type=int, default=40)
+    parser.add_argument('cpu-ratio-min', help='CPU minimal frequency ratio', type=int)
+    parser.add_argument('cpu-ratio-base', help='CPU base frequency ratio', type=int)
+    parser.add_argument('cpu-ratio-max', help='CPU maximal frequency ratio (with Turbo-Boost)', type=int)
+    parser.add_argument('cpu-tdp', help='CPU thermal design power (TDP)', type=int)
 
     # Formula error threshold
     parser.add_argument('cpu-error-threshold', help='Error threshold for the CPU power models (in Watt)', type=float, default=2.0)
@@ -77,7 +78,7 @@ def run_smartwatts(args, logger):
 
     # Shared parameters
     pushers = PusherGenerator().generate(config)
-    cpu_topology = CPUTopology(fconf['cpu-base-clock'], fconf['cpu-ratio-min'], fconf['cpu-ratio-base'], fconf['cpu-ratio-max'])
+    cpu_topology = CPUTopology(fconf['cpu-base-clock'], fconf['cpu-ratio-min'], fconf['cpu-ratio-base'], fconf['cpu-ratio-max'], fconf['cpu-tdp'])
 
     # CPU formula dispatcher
     def cpu_formula_factory(name: str, _):
@@ -90,7 +91,7 @@ def run_smartwatts(args, logger):
     # DRAM formula dispatcher
     def dram_formula_factory(name: str, _):
         scope = SmartWattsFormulaScope.DRAM
-        config = SmartWattsFormulaConfig(scope, fconf['cpu-rapl-ref-event'], fconf['cpu-error-threshold'], cpu_topology)
+        config = SmartWattsFormulaConfig(scope, fconf['dram-rapl-ref-event'], fconf['dram-error-threshold'], cpu_topology)
         return SmartWattsFormulaActor(name, pushers, config)
 
     dram_dispatcher = DispatcherActor('dram_dispatcher', dram_formula_factory, route_table)
