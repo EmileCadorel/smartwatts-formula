@@ -39,33 +39,46 @@ class PowerModelNotInitializedException(Exception):
     pass
 
 
-class ReportWrapper:
+class Sample:
     """
-    This wrapper stores the needed information for a System report and ease its usage when learning a power model.
+    This class stores the events and allows some operations on them.
     """
 
-    def __init__(self, rapl: Dict[str, float], core: Dict[str, int]) -> None:
+    def __init__(self, events: Dict[str, int]):
         """
-        Initialize a new report wrapper.
-        :param rapl: RAPL event group
-        :param core: Core event group
+        Initialize a new events wrapper.
         """
-        self.rapl = rapl
-        self.core = core
+        self.events = events
 
-    def X(self) -> List[int]:
+    def values(self) -> List[int]:
         """
         Creates and return a list of events value from the Core events group.
-        :return: List containing the Core events value sorted by event name.
+        :return: List containing the events value sorted by event name.
         """
-        return [v for _, v in sorted(self.core.items())]
+        return [v for _, v in sorted(self.events.items())]
 
-    def y(self) -> List[float]:
+
+class SamplesContainer:
+    """
+    This container stores the samples to be used for learning a power model.
+    """
+
+    def __init__(self) -> None:
         """
-        Creates and return a list of events value from the RAPL events group.
-        :return: List containing the RAPL events value.
+        Initialize the reports container.
         """
-        return [v for _, v in sorted(self.rapl.items())]
+        self.X = []
+        self.y = []
+
+    def store(self, ref_power: float, sample: Sample) -> None:
+        """
+        Store the values contained in the given report.
+        """
+        self.X.append(sample.values())
+        self.y.append(ref_power)
+
+    def __len__(self) -> int:
+        return len(self.X)
 
 
 class PowerModel:
@@ -81,68 +94,79 @@ class PowerModel:
         self.frequency = frequency
         self.model: Union[Ridge, None] = None
         self.hash: str = 'uninitialized'
-        self.reports: List[ReportWrapper] = []
+        self.id = 0
+        self.samples: SamplesContainer = SamplesContainer()
 
-    def _learn(self) -> None:
+    @staticmethod
+    def _select_best_model(first_model: Ridge, second_model: Ridge, sample: Sample, ref_power: float) -> Ridge:
+        """
+        Compare the two given models using the provided sample.
+        :param first: First power model
+        :param second: Second power model
+        :param sample: Sample to use to compare the two models
+        :param ref_power: Reference global power measurement (RAPL)
+        :return: The model having the lowest error for the given sample
+        """
+        if first_model is None:
+            return second_model
+
+        first_predict = first_model.predict([sample.values()]).item(0)
+        first_error = abs(ref_power - first_predict)
+
+        second_predict = second_model.predict([sample.values()]).item(0)
+        second_error = abs(ref_power - second_predict)
+
+        if first_error > second_error:
+            return second_model
+
+        return first_model
+
+    def learn(self, ref_power: float, global_core: Dict[str, int]):
         """
         Learn a new power model using the stored reports and update the formula hash.
         """
-        X = []
-        y = []
-        for report in self.reports:
-            X.append(report.X())
-            y.append(report.y())
+        sample = Sample(global_core)
+        self.samples.store(ref_power, sample)
+        if len(self.samples) < 3:
+            return
 
-        self.model = Ridge().fit(X, y)
-        self.hash = hashlib.blake2b(pickle.dumps(self.model), digest_size=20).hexdigest()
+        new_model = Ridge().fit(self.samples.X, self.samples.y)
+        self.model = self._select_best_model(self.model, new_model, sample, ref_power)
 
-    def store(self, rapl: Dict[str, float], global_core: Dict[str, int]) -> None:
-        """
-        Store the events group into the System reports list and learn a new power model.
-        :param rapl: RAPL events group
-        :param global_core: Core events group of all targets
-        """
-        self.reports.append(ReportWrapper(rapl, global_core))
+        if self.model == new_model:
+            self.id += 1
+            self.hash = hashlib.blake2b(pickle.dumps(self.model), digest_size=20).hexdigest()
 
-        if len(self.reports) > 3:
-            self._learn()
-
-    def compute_global_power_estimation(self, rapl: Dict[str, float], global_core: Dict[str, int]) -> float:
+    def compute_global_power_estimation(self, global_core: Dict[str, int]) -> float:
         """
         Compute the global power estimation using the power model.
-        :param rapl: RAPL events group
         :param global_core: Core events group of all targets
         :return: Power estimation of all running targets using the power model
         """
         if not self.model:
-            self.store(rapl, global_core)
             raise PowerModelNotInitializedException()
 
-        report = ReportWrapper(rapl, global_core)
-        return self.model.predict([report.X()])[0, 0]
+        events = Sample(global_core)
+        return self.model.predict([events.values()]).item(0)
 
-    def compute_target_power_estimation(self, rapl: Dict[str, float], global_core: Dict[str, int], target_core: Dict[str, int]) -> (float, float):
+    def compute_target_power_estimation(self, ref_power: float, global_core: Dict[str, int], target_core: Dict[str, int]) -> (float, float):
         """
         Compute a power estimation for the given target.
-        :param rapl: RAPL events group
+        :param ref_power: Reference global power measurement (RAPL)
         :param global_core: Core events group of all targets
         :param target_core: Core events group of any target
         :return: Power estimation for the given target and ratio of the target on the global power consumption
         :raise: PowerModelNotInitializedException when the power model is not initialized
         """
         if not self.model:
-            self.store(rapl, global_core)
             raise PowerModelNotInitializedException()
 
-        ref_power = next(iter(rapl.values()))
-        system = ReportWrapper(rapl, global_core).X()
-        target = ReportWrapper(rapl, target_core).X()
+        system = Sample(global_core).values()
+        target = Sample(target_core).values()
 
-        coefs = next(iter(self.model.coef_))
-        sum_coefs = sum(coefs)
-
+        sum_coefs = sum(self.model.coef_)
         ratio = 0.0
-        for index, coef in enumerate(coefs):
+        for index, coef in enumerate(self.model.coef_):
             try:
                 ratio += (coef / sum_coefs) * (target[index] / system[index])
             except ZeroDivisionError:
@@ -189,10 +213,10 @@ class SmartWattsFormula:
 
         return last_layer_freq
 
-    def _compute_pkg_frequency(self, system_msr: Dict[str, int]) -> float:
+    def compute_pkg_frequency(self, system_msr: Dict[str, int]) -> float:
         """
         Compute the average package frequency.
-        :param msr: MSR events group of System target
+        :param system_msr: MSR events group of System target
         :return: Average frequency of the Package
         """
         return (self.cpu_topology.get_base_frequency() * system_msr['APERF']) / system_msr['MPERF']
@@ -203,4 +227,4 @@ class SmartWattsFormula:
         :param system_core: Core events group of System target
         :return: Power model to use for the current frequency
         """
-        return self.models[self._get_frequency_layer(self._compute_pkg_frequency(system_core))]
+        return self.models[self._get_frequency_layer(self.compute_pkg_frequency(system_core))]
