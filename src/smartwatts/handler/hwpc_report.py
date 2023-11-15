@@ -50,6 +50,8 @@ class HwPCReportHandler(Handler):
         Handler.__init__(self, state)
         self.models = self._gen_models_dict()
         self.ticks = OrderedDict()
+        self.alls = {}
+        self.storeModels = {}
 
     def _gen_models_dict(self):
         """
@@ -96,94 +98,125 @@ class HwPCReportHandler(Handler):
          Process a HWPC report and send the result(s) to a pusher actor.
          :param msg: Received message
         """
-        logging.debug('received message: %s', msg)
-        self.ticks.setdefault(msg.timestamp, {}).update({msg.target: msg})
+        
+        logging.debug('PATCHED : received message: %s', msg)
+        self._process_report (msg)
 
-        # Start to process the oldest tick only after receiving at least 5 ticks.
-        # We wait before processing the ticks in order to mitigate the possible delay between the sensor/database.
-        if len(self.ticks) > 5:
-            power_reports, formula_reports = self._process_oldest_tick()
-            for report in itertools.chain(power_reports, formula_reports):
-                for name, pusher in self.state.pushers.items():
-                    if isinstance(report, pusher.state.report_model):
-                        pusher.send_data(report)
-                        logging.debug('sent report: %s to %s', report, name)
 
-    def _process_oldest_tick(self):
+
+    def _process_report (self, report : HWPCReport):
         """
-        Process the oldest tick stored in the stack and generate power reports for the running target(s).
-        :return: Power reports of the running target(s)
+        Process the received report and trigger the processing of the old ticks.
+        :param report: HWPC report of a target
         """
-        timestamp, hwpc_reports = self.ticks.popitem(last=False)
 
-        # reports of the current tick
+        if report.target == "all":
+            self.alls [report.timestamp] = report
+        else:
+            self.ticks.setdefault(report.timestamp, {}).update({report.target: report})
+
+        if len (self.alls) != 0:
+            power_reports = self._compute_global_estimation ()
+            self._push_reports (power_reports)
+
+        if len (self.ticks) != 0:
+            power_reports = self._compute_process_estimations ()
+            self._push_reports (power_reports)
+
+
+    def _push_reports (self, reports):
+        for report in reports:
+            for name, pusher in self.state.pushers.items():
+                if isinstance(report, pusher.state.report_model):
+                    pusher.send_data(report)
+                    logging.debug('sent report: %s to %s', report, name)
+
+
+
+    def _compute_global_estimation (self):
+        """
+        Process an report 'all' estimation, constructing the model for future process estimation
+        """
+
         power_reports = []
-        formula_reports = []
+        for timestamp, global_report in self.alls.items ():
+            rapl = self._gen_rapl_events_group (global_report)
+            avg_msr = self._gen_msr_events_group (global_report)
 
-        # prepare required events group of Global target
-        try:
-            global_report = hwpc_reports.pop('all')
-        except KeyError:
-            # cannot process this tick without the reference measurements
-            return power_reports, formula_reports
 
-        rapl = self._gen_rapl_events_group(global_report)
-        avg_msr = self._gen_msr_events_group(global_report)
-        global_core = self._gen_agg_core_report_from_running_targets(hwpc_reports)
-
-        # compute RAPL power report
-        rapl_power = rapl[self.state.config.rapl_event]
-        power_reports.append(
-            self._gen_power_report(timestamp, 'rapl', self.state.config.rapl_event, 0.0, rapl_power, 1.0, {}))
-
-        if not global_core:
-            return power_reports, formula_reports
-
-        # fetch power model to use
-        try:
-            pkg_frequency = self.compute_pkg_frequency(avg_msr)
-            model = self.get_power_model(avg_msr)
-        except ZeroDivisionError:
-            return power_reports, formula_reports
-
-        # compute Global target power report
-        try:
-            raw_global_power = model.compute_power_estimation(global_core)
-            power_reports.append(
-                self._gen_power_report(timestamp, 'global', model.hash, raw_global_power, raw_global_power, 1.0, {}))
-        except NotFittedError:
-            model.store_report_in_history(rapl_power, global_core)
-            model.learn_power_model(self.state.config.min_samples_required, 0.0, self.state.config.cpu_topology.tdp)
-            return power_reports, formula_reports
-
-        # compute per-target power report
-        for target_name, target_report in hwpc_reports.items():
-            raw_target_power = model.compute_power_estimation(self._gen_core_events_group(target_report))
-            target_power, target_ratio = model.cap_power_estimation(raw_target_power, raw_global_power)
-            power_reports.append(
-                self._gen_power_report(
-                    timestamp,
-                    target_name,
-                    model.hash,
-                    raw_target_power,
-                    target_power,
-                    target_ratio,
-                    target_report.metadata)
+            rapl_power = rapl[self.state.config.rapl_event]
+            power_reports.append (
+                self._gen_power_report (timestamp, "rapl", self.state.config.rapl_event, 0.0, rapl_power, 1.0, {})
             )
 
-        # compute power model error from reference
-        model_error = fabs(rapl_power - raw_global_power)
+            pkg_frequency = self.compute_pkg_frequency (avg_msr)
+            model = self.get_power_model (avg_msr)
+            self.storeModels [timestamp] = (model, pkg_frequency, rapl_power) # storing the model at timestamp, for future package estimation
 
-        # store global report
-        model.store_report_in_history(rapl_power, global_core)
+        self.alls = {}
+        return power_reports
 
-        # learn new power model if error exceeds the error threshold
-        if model_error > self.state.config.error_threshold:
-            model.learn_power_model(self.state.config.min_samples_required, 0.0, self.state.config.cpu_topology.tdp)
 
-        # store information about the power model used for this tick
-        formula_reports.append(self._gen_formula_report(timestamp, pkg_frequency, model, model_error))
-        return power_reports, formula_reports
+    def _compute_process_estimations (self):
+        """
+        Use computed models from 'all' reports to compute the estimation of processes when all the reports of a timestamp are received
+        """
+
+        keep = OrderedDict ()
+        power_reports = []
+        if len (self.ticks) > 1:
+            i = 0
+            for timestamp, hwpc_reports in self.ticks.items ():
+                if i < len (self.ticks) - 1 and timestamp in self.storeModels:
+                    (model, pkg_frequency, rapl_power) = self.storeModels [timestamp]
+                    global_core = self._gen_agg_core_report_from_running_targets (hwpc_reports)
+                    raw_global_power = 0
+                    # compute Global target power report
+                    try:
+                        raw_global_power = model.compute_power_estimation(global_core)
+                        power_reports.append(
+                            self._gen_power_report(timestamp, 'global', model.hash, raw_global_power, raw_global_power, 1.0, {}))
+                    except NotFittedError:
+                        model.store_report_in_history(rapl_power, global_core)
+                        model.learn_power_model(self.state.config.min_samples_required, 0.0, self.state.config.cpu_topology.tdp)
+                        keep [timestamp] = hwpc_reports
+                        continue
+
+                    # compute per-target power report
+                    for target_name, target_report in hwpc_reports.items():
+                        raw_target_power = model.compute_power_estimation(self._gen_core_events_group(target_report))
+                        target_power, target_ratio = model.cap_power_estimation(raw_target_power, raw_global_power)
+                        power_reports.append(
+                            self._gen_power_report(
+                                timestamp,
+                                target_name,
+                                model.hash,
+                                raw_target_power,
+                                target_power,
+                                target_ratio,
+                                target_report.metadata)
+                        )
+
+                    # compute power model error from reference
+                    model_error = fabs(rapl_power - raw_global_power)
+
+                    # store global report
+                    model.store_report_in_history(rapl_power, global_core)
+
+                    # learn new power model if error exceeds the error threshold
+                    if model_error > self.state.config.error_threshold:
+                        model.learn_power_model(self.state.config.min_samples_required, 0.0, self.state.config.cpu_topology.tdp)
+
+                    # store information about the power model used for this tick
+                    power_reports.append(self._gen_formula_report(timestamp, pkg_frequency, model, model_error))
+                    del self.storeModels [timestamp]
+                else:
+                    keep [timestamp] = hwpc_reports
+                i += 1
+
+            self.ticks = keep
+        return power_reports
+
 
     def _gen_formula_report(self, timestamp, pkg_frequency, model, error):
         """
